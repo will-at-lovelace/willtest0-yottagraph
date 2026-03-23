@@ -1,0 +1,361 @@
+---
+description: Rules for developing ADK agents in the agents/ directory
+globs: agents/**
+alwaysApply: false
+---
+
+# Agent Development (Google ADK)
+
+This project supports developing and deploying AI agents alongside the UI. Agents live in the `agents/` directory and deploy to Vertex AI Agent Engine via the `/deploy_agent` command.
+
+## Directory Structure
+
+Each agent is a self-contained Python package. **Directory names must use underscores, not hyphens** (ADK uses the directory name as a Python identifier).
+
+```
+agents/my_agent/            # Underscores only! "my-agent" will NOT work.
+├── __init__.py             # Required (can be empty)
+├── agent.py                # Required: must export root_agent
+├── requirements.txt        # Required: must include google-adk
+└── .env                    # Optional: local env vars (git-ignored)
+```
+
+## Writing an Agent
+
+Agents use the [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/). The core pattern:
+
+```python
+from google.adk.agents import Agent
+
+def my_tool(query: str) -> dict:
+    """Tool docstrings become the LLM's understanding of what the tool does.
+    Be specific about parameters and return values."""
+    # Tool implementation
+    return {"result": "..."}
+
+root_agent = Agent(
+    model="gemini-2.0-flash",
+    name="my_agent",
+    instruction="Clear instructions about the agent's purpose and capabilities.",
+    tools=[my_tool],
+)
+```
+
+Key rules:
+- The `agent.py` file MUST export a variable named `root_agent`
+- Tool functions should have detailed docstrings -- the LLM reads these to understand when and how to use each tool
+- Use `google-adk` for the agent framework, `httpx` for HTTP calls
+- Pin dependency versions in `requirements.txt` for reproducible deployments
+
+## Connecting to the Elemental API
+
+Use `broadchurch_auth` for all Elemental API calls. It lives at
+`agents/broadchurch_auth.py` and is automatically bundled into each agent
+directory at deploy time. It handles:
+
+- Routing through the Broadchurch Portal gateway proxy in production
+  (no direct QS credentials needed — the portal handles Auth0 M2M auth)
+- Authenticating to the proxy with a per-tenant API key from
+  `broadchurch.yaml` (`gateway.qs_api_key`)
+- Falling back to `ELEMENTAL_API_URL` + `ELEMENTAL_API_TOKEN` env vars
+  for local dev
+
+```python
+try:
+    from broadchurch_auth import elemental_client
+except ImportError:
+    from .broadchurch_auth import elemental_client
+
+def get_schema() -> dict:
+    """Get the yottagraph schema."""
+    resp = elemental_client.get("/elemental/metadata/schema")
+    resp.raise_for_status()
+    return resp.json()
+
+def find_entities(expression: str, limit: int = 10) -> dict:
+    """Search for entities."""
+    resp = elemental_client.post("/elemental/find", data={"expression": expression, "limit": str(limit)})
+    resp.raise_for_status()
+    return resp.json()
+```
+
+The try/except is required because the import path differs between local
+dev (`agents/` on sys.path → absolute import) and Agent Engine runtime
+(code packaged inside an ADK module → relative import).
+
+**Do NOT** hardcode URLs or manually handle auth tokens. Do NOT read
+`broadchurch.yaml` directly — `broadchurch_auth` handles all of this.
+
+Key endpoints:
+- `GET /elemental/metadata/schema` — entity types and properties
+- `POST /elemental/find` — search for entities
+- `POST /elemental/entities/properties` — get entity property values
+- `GET /entities/lookup?q=<name>` — look up entity by name
+
+Requirements for agents using the Elemental API (add to `requirements.txt`):
+```
+google-auth>=2.20.0
+pyyaml>=6.0
+```
+
+## Local Testing
+
+Test agents locally before deploying. Run `adk web` from the `agents/`
+directory (NOT from inside the agent folder — ADK discovers agents by
+scanning subdirectories):
+
+```bash
+cd agents/                  # The PARENT of your agent directories
+pip install -r my_agent/requirements.txt
+
+# Required: tell ADK to use Vertex AI for Gemini
+export GOOGLE_CLOUD_PROJECT=broadchurch
+export GOOGLE_CLOUD_LOCATION=us-central1
+export GOOGLE_GENAI_USE_VERTEXAI=1
+
+# For agents that call the Elemental API:
+export ELEMENTAL_API_URL=https://stable-query.lovelace.ai
+export ELEMENTAL_API_TOKEN=<your-token>
+
+adk web                     # Opens browser UI at http://127.0.0.1:8000/dev-ui/
+```
+
+Select your agent from the dropdown in the web UI. You can also run a single agent directly: `adk run my_agent/`
+
+`broadchurch_auth.py` lives at the `agents/` root, so it's importable
+during local dev (agents/ is the CWD → on sys.path). At deploy time, the
+workflow copies it into the agent directory alongside `broadchurch.yaml`.
+
+In production, all Elemental API calls go through the Portal Gateway at
+`{gateway_url}/api/qs/{org_id}/...`. The agent sends `X-Api-Key` (from
+`broadchurch.yaml`) and the portal injects its own Auth0 M2M token
+upstream. This keeps QS credentials out of agents entirely and gives the
+platform a per-tenant kill switch.
+
+**Important:** Always use the try/except import pattern shown above. ADK
+wraps agent code in a package at deploy time, so absolute imports fail at
+runtime in Agent Engine — the relative import fallback is required.
+
+## Deployment
+
+Two ways to deploy:
+
+1. **Portal UI** -- Open the project in the Broadchurch Portal. It scans
+   `agents/` in your GitHub repo and shows undeployed agents with a Deploy
+   button. Make sure your code is pushed to `main` first.
+2. **Cursor command** -- Run `/deploy_agent`. It reads `broadchurch.yaml` and
+   triggers the same workflow.
+
+Both paths trigger `deploy-agent.yml` in GitHub Actions, which runs
+`adk deploy agent_engine` and then registers the agent with the Portal Gateway.
+
+Manual CLI deployment (advanced):
+
+```bash
+adk deploy agent_engine \
+  --project <from broadchurch.yaml> \
+  --region <from broadchurch.yaml> \
+  --staging_bucket <from broadchurch.yaml> \
+  --display_name "<agent-name>" \
+  --trace_to_cloud \
+  agents/<agent-name>/
+```
+
+## How Agents Reach the App
+
+Once deployed, the agent is reachable through the Portal Gateway:
+
+```
+App (useAgentChat composable)
+  → POST NUXT_PUBLIC_GATEWAY_URL/api/agents/{tenantId}/{agentId}/query
+  → Portal Gateway proxies to Vertex AI Agent Engine (streamQuery)
+  → Agent runs (may invoke tools, make multiple LLM calls)
+  → Gateway collects the ADK event stream, extracts final text
+  → App displays it
+```
+
+The gateway URL and tenant ID come from `broadchurch.yaml` (injected as
+`NUXT_PUBLIC_GATEWAY_URL` and `NUXT_PUBLIC_TENANT_ORG_ID`).
+
+### Agent Discovery
+
+The app discovers deployed agents by fetching the tenant config:
+
+```
+GET {NUXT_PUBLIC_GATEWAY_URL}/api/config/{NUXT_PUBLIC_TENANT_ORG_ID}
+```
+
+The response includes an `agents` array:
+
+```json
+{
+  "agents": [
+    { "name": "filing_analyst", "display_name": "Filing Analyst", "engine_id": "1234567890" },
+    { "name": "research_bot", "display_name": "Research Bot", "engine_id": "0987654321" }
+  ],
+  "features": { "chat": true, ... },
+  ...
+}
+```
+
+Each agent entry has:
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | `string` | Agent directory name (e.g. `filing_analyst`) |
+| `display_name` | `string` | Human-readable name for the UI |
+| `engine_id` | `string` | Vertex AI Agent Engine resource ID — used as `{agentId}` in query/stream URLs |
+
+The `engine_id` is the key value — it becomes the `{agentId}` path
+parameter in `POST /api/agents/{tenantId}/{agentId}/query`.
+
+**How agents get populated:** The portal discovers agents from two sources:
+1. **Firestore** — agents registered by the deploy workflow (`deploy-agent.yml`
+   calls `POST /api/agents/{tenantId}` to register)
+2. **Agent Engine API** — the portal also queries Vertex AI for reasoning
+   engines whose display name starts with the project name (e.g.
+   `my-project--filing_analyst`), catching agents that were deployed but
+   not yet registered
+
+Both sources are merged and deduplicated by name. If the config endpoint
+returns an empty `agents` array, no agents have been deployed yet.
+
+Use `useTenantConfig()` to fetch this config from Vue code:
+
+```typescript
+import { useTenantConfig } from '~/composables/useTenantConfig';
+
+const { config, fetchConfig } = useTenantConfig();
+await fetchConfig();
+
+const agents = config.value?.agents ?? [];
+const agentId = agents[0]?.engine_id; // use as {agentId} in query URLs
+```
+
+### Gateway Request
+
+```
+POST {NUXT_PUBLIC_GATEWAY_URL}/api/agents/{tenantId}/{agentId}/query
+Content-Type: application/json
+
+{ "message": "Summarize the latest 8-K filing", "session_id": "optional-session-id" }
+```
+
+Omit `session_id` on the first message — the gateway auto-creates one.
+
+### Gateway Response Format
+
+```json
+{
+  "output": "The agent's final text response",
+  "session_id": "session-abc-123",
+  "events": [ /* raw ADK event stream */ ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `output` | `string \| any[]` | Usually the agent's final text. Falls back to the raw `events` array if the gateway couldn't extract text. |
+| `session_id` | `string` | Pass back on subsequent messages to continue the conversation. |
+| `events` | `any[]` | Full ADK event stream. Useful for debugging or building UIs that show intermediate agent steps. |
+
+**Important:** `output` is NOT always a string. When the agent's response
+involves complex tool chains, the gateway's server-side extraction may miss
+the text and return the raw events array instead. Always use
+`extractAgentText()` to parse `output` safely rather than treating it as a
+string directly.
+
+### ADK Event Stream Format
+
+The `events` array contains one object per step the agent took. Each event
+has `content.parts[]` where each part is one of:
+
+```json
+{ "text": "The agent's text response..." }
+{ "functionCall": { "name": "search", "args": { "q": "AAPL" } } }
+{ "functionResponse": { "name": "search", "response": { "results": [...] } } }
+```
+
+A typical stream for an agent that uses a tool:
+
+```json
+[
+  { "content": { "parts": [{ "functionCall": { "name": "search", "args": {"q": "AAPL 8-K"} } }], "role": "model" } },
+  { "content": { "parts": [{ "functionResponse": { "name": "search", "response": {"results": ["..."]} } }], "role": "tool" } },
+  { "content": { "parts": [{ "text": "Here is the summary of the 8-K filing..." }], "role": "model" } }
+]
+```
+
+The final text is the last `text` part that isn't in a `functionCall` or
+`functionResponse` event. Events may also arrive as JSON strings rather
+than objects — always handle both.
+
+### Parsing Agent Responses (Non-Streaming)
+
+For one-shot calls (server routes, background tasks) where streaming isn't
+needed, use the buffered `/query` endpoint with `extractAgentText`:
+
+```typescript
+import { extractAgentText } from '~/composables/useAgentChat';
+
+const response = await $fetch(url, { method: 'POST', body: { message } });
+const text = extractAgentText(response.output);
+```
+
+`extractAgentText` handles: plain strings, ADK event stream arrays (with
+JSON-string or object elements), single event objects, and several legacy
+Agent Engine response shapes. It skips `functionCall` / `functionResponse`
+events and returns the agent's final text.
+
+### Streaming Responses
+
+The gateway also exposes a streaming endpoint that returns Server-Sent
+Events as the agent executes. **The `useAgentChat` composable uses this by
+default** — it tries `/stream` first and falls back to `/query`
+automatically.
+
+```
+POST {NUXT_PUBLIC_GATEWAY_URL}/api/agents/{tenantId}/{agentId}/stream
+Content-Type: application/json
+
+{ "message": "Summarize the latest 8-K filing", "session_id": "optional" }
+```
+
+The response is an SSE stream with these event types:
+
+| Event | Data Shape | Description |
+|---|---|---|
+| `text` | `{ "text": "..." }` | Agent text output (replaces previous text) |
+| `function_call` | `{ "name": "...", "args": {...} }` | Agent is calling a tool |
+| `function_response` | `{ "name": "...", "response": {...} }` | Tool returned a result |
+| `error` | `{ "message": "..." }` | Error during processing |
+| `done` | `{ "session_id": "...", "text": "..." }` | Stream complete with final text |
+
+For custom agent UIs that need streaming, import `readSSE`:
+
+```typescript
+import { readSSE } from '~/composables/useAgentChat';
+
+const res = await fetch(streamUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: 'Hello' }),
+});
+
+for await (const { event, data } of readSSE(res)) {
+    if (event === 'text') console.log('Agent says:', data.text);
+    if (event === 'function_call') console.log('Calling:', data.name);
+    if (event === 'done') console.log('Session:', data.session_id);
+}
+```
+
+The `done` event always includes the final extracted text, so you don't
+need to track text deltas yourself.
+
+## Agent Design Guidelines
+
+- Keep agents focused: one agent per domain or task type
+- Write clear, specific instructions -- the LLM follows them literally
+- Tool docstrings are critical: they're the LLM's API documentation
+- Handle errors gracefully in tools: return error messages, don't raise exceptions
+- Use `get_schema` as a discovery tool so the agent can learn about entity types at runtime

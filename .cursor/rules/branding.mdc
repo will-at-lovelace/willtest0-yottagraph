@@ -1,0 +1,43 @@
+---
+description: Apply when working on visual styling, colors, typography, theming, branding, or UI appearance.
+alwaysApply: false
+---
+
+# Lovelace Brand R2
+
+The app follows Lovelace Brand R2 guidelines. For the full specification (color ramps, accessibility, visual effects), read `branding/BRANDING.md`.
+
+## Quick Reference
+
+- **Theme**: Single dark theme. No light mode, no theme switching.
+- **Core colors**: Jet Black `#0A0A0A`, Pure White `#FFFFFF`, Cyber Green `#3FEA00`, Sonic Silver `#757575`
+- **Secondary colors**: Electric Blue `#003BFF`, Blaze Orange `#FF5C00`
+- **Semantic**: Amber `#FF9F0A` (warnings), Red `#EF4444` (errors)
+- **Fonts**: FK Grotesk (body), FK Grotesk Mono (headlines, buttons, code). Falls back to Inter / system-ui. See `public/fonts/README.md` for setup.
+- **Icons**: Material Design Icons (mdi) via Vuetify
+
+## Branding Files
+
+These files are copied wholesale from the canonical branding source (`moongoose/ui/news-ui`). Update them by running `/update_branding`. Do **not** edit them in place.
+
+| File | Purpose |
+|---|---|
+| `branding/BRANDING.md` | Full brand specification |
+| `composables/useNewsTheme.ts` | Theme colors and CSS variable application |
+| `composables/useThemeClasses.ts` | Theme-aware class utilities |
+| `assets/theme-styles.css` | Theme CSS classes |
+| `assets/fonts.css` | `@font-face` declarations |
+| `assets/brand-globals.css` | Global CSS variables, typography, utilities |
+| `public/fonts/README.md` | Font setup instructions |
+| `public/LL-logo-full-wht.svg` | Primary logo (white, for dark backgrounds) |
+
+## Vuetify Theme
+
+The `lovelaceDark` Vuetify theme is defined in `nuxt.config.ts` under `vuetify.vuetifyOptions.theme`. This is the same theme used by the Broadchurch Portal. It provides Brand R2 colors to all Vuetify components automatically (primary = Cyber Green, secondary = Electric Blue, etc.). Component defaults (rounded buttons, outlined cards, etc.) are also set in `nuxt.config.ts` under `vuetify.vuetifyOptions.defaults`.
+
+## Integration
+
+- `composables/useCustomTheme.ts` is a thin adapter around `useNewsTheme`. Use `useCustomTheme()` or `useThemeClasses()` in components.
+- CSS variables (`--lv-green`, `--lv-black`, etc.) and theme classes (`.theme-card`, `.theme-text-primary`, etc.) are available globally.
+- `useNewsTheme` calls `theme.change('lovelaceDark')` to activate the Vuetify theme. This must match the theme name in `nuxt.config.ts`.
+- If you need to change how the branding integrates with Aether, modify the adapter -- not the branding files.
