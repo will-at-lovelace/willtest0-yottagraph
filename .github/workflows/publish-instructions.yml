@@ -1,0 +1,139 @@
+name: Publish Aether Instructions
+
+on:
+  push:
+    paths:
+      - 'rules/**'
+      - 'commands/**'
+      - 'skills/**'
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: false
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: publish-aether-instructions
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: app_token
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app_token.outputs.token }}
+          fetch-depth: 2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Populate skills/ from npm skill packages (postinstall → copy-skills).
+      # Without this, the published tarball only contains tracked files under
+      # skills/ (e.g. test-api-queries), not elemental-api or data-model.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Bundle instructions
+        run: bash scripts/publish-instructions.sh --bump "${{ github.event.inputs.version_bump || 'patch' }}"
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./packages/aether-instructions/package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          PKG="@yottagraph-app/aether-instructions"
+          set +e
+          NPM_OUTPUT=$(npm view "$PKG" versions --json 2>&1)
+          NPM_EXIT=$?
+          set -e
+
+          if [ $NPM_EXIT -ne 0 ]; then
+            if echo "$NPM_OUTPUT" | grep -q "E404"; then
+              echo "Package not yet published — first publish"
+              echo "publish=true" >> $GITHUB_OUTPUT
+            else
+              echo "::error::npm view failed: $NPM_OUTPUT"
+              exit 1
+            fi
+          else
+            HIGHEST=$(echo "$NPM_OUTPUT" \
+              | node -p "JSON.parse(require('fs').readFileSync(0,'utf8'))
+                  .map(v=>v.split('.').map(Number))
+                  .sort((a,b)=>a[0]-b[0]||a[1]-b[1]||a[2]-b[2])
+                  .pop().join('.')")
+            if npx -y semver "$VERSION" -r ">$HIGHEST" > /dev/null 2>&1; then
+              echo "publish=true" >> $GITHUB_OUTPUT
+            else
+              echo "Version $VERSION is not higher than $HIGHEST — skipping publish"
+              echo "publish=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Verify npm auth
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          echo "Checking npm authentication..."
+          if ! npm whoami 2>/dev/null; then
+            echo "::error::NPM_TOKEN is invalid or expired. Go to npmjs.com/settings/tokens and verify the 'lovelace-ci' automation token exists with Bypass 2FA enabled. Then update the secret: gh secret set NPM_TOKEN"
+            echo "::error::See docs/CI_OPS.md for full troubleshooting steps."
+            exit 1
+          fi
+          echo "Authenticated as: $(npm whoami)"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish to npm
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          cd packages/aether-instructions
+          echo "Publishing @yottagraph-app/aether-instructions@${{ steps.version.outputs.version }}"
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Commit version bump
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          git config user.name lovelace-ci[bot]
+          git config user.email lovelace-ci[bot]@users.noreply.github.com
+          git add packages/aether-instructions/package.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: publish aether-instructions@${{ steps.version.outputs.version }} [skip ci]"
+            git push
+          fi
+
+      - name: Create release
+        if: steps.version.outputs.publish == 'true'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: aether-instructions-v${{ steps.version.outputs.version }}
+          release_name: Aether Instructions v${{ steps.version.outputs.version }}
+          body: |
+            Automated release of Aether Cursor instructions (rules, commands, skills).
+
+            Package: `@yottagraph-app/aether-instructions@${{ steps.version.outputs.version }}`
+
+            Install in tenant projects by running `/update_instructions`.
+          draft: false
+          prerelease: false
